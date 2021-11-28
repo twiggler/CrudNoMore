@@ -1,5 +1,4 @@
 import { Column, Reference, qualifiedTableName, toTable, fromTable } from "./schema";
-import { TupleHead, TupleSingle } from "./tuple";
 import { apply, pipe } from "fp-ts/lib/function";
 import * as RA from "fp-ts/lib/ReadonlyArray";
 import * as NRA from "fp-ts/lib/ReadonlyNonEmptyArray";
@@ -142,34 +141,32 @@ export const readP = async <D extends Document, Ext>(
 
 export type TableMutations<C extends readonly Column[] = readonly Column[]> = {
 	[TableName in InferTables<C>]?: TableMutation<
-		FilterColumns<C, "qualifiedTableName", TableName>
+		FilterColumns<C[number], "qualifiedTableName", TableName>
 	>;
 };
 
-export interface TableMutation<C extends readonly Column[] = never> {
+export interface TableMutation<C extends Column = never> {
 	readonly create?: TableRow<C>[];
 	readonly update?: TableRow<C>[];
 	readonly delete?: [C] extends [never]
 		? unknown
-		: InferColumnType<TupleSingle<FilterColumns<C, "isPrimary", true>>>[];
+		: InferColumnType<FilterColumns<C, "isPrimary", true>>[];
 }
 
 export type ReadModels<C extends readonly Column[] = readonly Column[]> = {
-	[TableName in InferTables<C>]: ReadModel<FilterColumns<C, "qualifiedTableName", TableName>>;
-};
-
-export type ReadModel<C extends readonly Column[] = never> = {
-	[ColumnName in InferColumnNames<C>]?: InferColumnType<
-		TupleSingle<FilterColumns<C, "name", ColumnName>>
+	[TableName in InferTables<C>]: ReadModel<
+		FilterColumns<C[number], "qualifiedTableName", TableName>
 	>;
 };
 
-export type TableRow<C extends readonly Column[] = never> = [C] extends [never]
+export type ReadModel<C extends Column = never> = {
+	[ColumnName in C["name"]]?: InferColumnType<FilterColumns<C, "name", ColumnName>>;
+};
+
+export type TableRow<C extends Column = never> = [C] extends [never]
 	? { [columnName: string]: unknown }
 	: {
-			[ColumnName in InferColumnNames<C>]?: InferColumnType<
-				TupleSingle<FilterColumns<C, "name", ColumnName>>
-			>;
+			[ColumnName in C["name"]]?: InferColumnType<FilterColumns<C, "name", ColumnName>>;
 	  };
 
 const toGraph = (document: Document): readonly [Graph<Reference>, string] =>
@@ -233,22 +230,9 @@ const monoidTraceResult: MD.Monoid<TraceResult> = MD.struct({
 
 type InferTables<C extends readonly Column[]> = C[number]["qualifiedTableName"];
 
-type InferColumnNames<C extends readonly Column[]> = C[number]["name"];
-
 type InferColumnType<C> = C extends Column<any, any, infer Type, any> ? Type : never;
 
-type FilterColumns<C extends readonly Column[], K extends keyof Column, V> = C extends [
-	infer H,
-	...infer T
-]
-	? T extends readonly Column[]
-		? H extends Column
-			? H[K] extends V
-				? [H, ...FilterColumns<T, K, V>]
-				: [...FilterColumns<T, K, V>]
-			: never
-		: never
-	: [];
+type FilterColumns<C extends Column, K extends keyof C, V> = C extends { [X in K]: V } ? C : never;
 
 type InferDocumentRootType<D> = D extends Document<infer Root, readonly Column[]>
 	? InferColumnType<Root>
