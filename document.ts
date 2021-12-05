@@ -115,11 +115,11 @@ export const read = <D extends Document, Ext>(
 		O.fold(
 			() => RTE.left(Error("Tables are not connected.")),
 			(refs) =>
-				secureRead(id, document.columns, refs) as RTE.ReaderTaskEither<
-					pg.IDatabase<Ext>,
-					Error,
-					InferReadModel<Document>
-				>
+				secureRead(
+					id,
+					NRA.tail(document.columns) as NRA.ReadonlyNonEmptyArray<Column>,
+					refs
+				) as RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, InferReadModel<Document>>
 		)
 	);
 };

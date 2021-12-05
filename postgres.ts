@@ -125,14 +125,16 @@ const secureReadQ = (
 	documentKey: unknown,
 	columns: NRA.ReadonlyNonEmptyArray<Column>,
 	refs: NRA.ReadonlyNonEmptyArray<Reference>
-): string => {
-	return query(
+): string =>
+	query(
 		select(
 			jsonBuildObject(
-				...pipe(
-					refs,
-					RA.map(fromTable),
-					RA.map((tableName) => [`'${tableName}'`, jsonAgg(`${tableName}.*`)] as const)
+				pipe(
+					columns,
+					NRA.groupBy(qualifiedTableName),
+					RR.collect(S.Ord)(
+						(tableName, columns) => [`'${tableName}'`, jsonAgg(columns)] as const
+					)
 				)
 			)
 		),
@@ -145,7 +147,6 @@ const secureReadQ = (
 			)
 		)
 	);
-};
 
 const insert = flow(insertQ, executeQueryAny);
 
@@ -234,10 +235,16 @@ const imputeValues = (values: Values, columnNames: readonly string[]): readonly 
 	);
 };
 
-const jsonBuildObject = (...fields: readonly (readonly [string, string])[]): string =>
+const jsonBuildObject = (fields: readonly (readonly [string, string])[]): string =>
 	pipe(RA.flatten(fields), joinToString(", "), (args) => `json_build_object(${args})`);
 
-const jsonAgg = (expr: string) => `json_agg(${expr})`;
+const jsonAgg = (columns: NRA.ReadonlyNonEmptyArray<Column>): string =>
+	pipe(
+		columns,
+		NRA.map((col) => [`'${columnName(col)}'`, qualifiedColumnName(col)] as const),
+		jsonBuildObject,
+		(param) => `json_agg((${param}))`
+	);
 
 const valueListWithAlias = (
 	values: Values,
