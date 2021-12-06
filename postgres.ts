@@ -243,7 +243,7 @@ const jsonAgg = (columns: NRA.ReadonlyNonEmptyArray<Column>): string =>
 		columns,
 		NRA.map((col) => [`'${columnName(col)}'`, qualifiedColumnName(col)] as const),
 		jsonBuildObject,
-		(param) => `json_agg((${param}))`
+		(param) => `coalesce(json_agg((${param})), '[]')`
 	);
 
 const valueListWithAlias = (

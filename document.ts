@@ -160,7 +160,7 @@ export type ReadModels<C extends readonly Column[] = readonly Column[]> = {
 };
 
 export type ReadModel<C extends Column = never> = {
-	[ColumnName in C["name"]]?: InferColumnType<FilterColumns<C, "name", ColumnName>>;
+	[ColumnName in C["name"]]: InferColumnType<FilterColumns<C, "name", ColumnName>>;
 };
 
 export type TableRow<C extends Column = never> = [C] extends [never]
