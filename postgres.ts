@@ -8,7 +8,6 @@ import {
 	Column,
 	columnName,
 	fromColumn,
-	fromTable,
 	qualifiedColumnName,
 	qualifiedTableName,
 	Reference,
@@ -132,14 +131,31 @@ const secureReadQ = (
 				pipe(
 					columns,
 					NRA.groupBy(qualifiedTableName),
-					RR.collect(S.Ord)(
-						(tableName, columns) => [`'${tableName}'`, jsonAgg(columns)] as const
-					)
+					RR.partitionWithIndex(
+						(tableName, _) => tableName === pipe(NRA.head(refs), toTable)
+					),
+					SEP.bimap(
+						RR.collect(S.Ord)(
+							(tableName, columns) =>
+								[
+									`'${tableName}'`,
+									pipe(columns, columnKeyValues, jsonBuildObject, jsonAgg),
+								] as const
+						),
+						RR.collect(S.Ord)(
+							(tableName, columns) =>
+								[
+									`'${tableName}'`,
+									pipe(columns, columnKeyValues, jsonObjectAgg),
+								] as const
+						)
+					),
+					({ left, right }) => RA.concat(left)(right)
 				)
 			)
 		),
-		from(pipe(NRA.head(refs), fromTable)),
-		...RA.map(({ from, to }: Reference) => leftJoin(to, from))(NRA.tail(refs)),
+		from(pipe(NRA.head(refs), toTable)),
+		...RA.map(({ from, to }: Reference) => leftJoin(to, from))(refs),
 		where(
 			eq(
 				pipe(NRA.head(refs), fromColumn, qualifiedColumnName, pg.as.alias),
@@ -238,13 +254,16 @@ const imputeValues = (values: Values, columnNames: readonly string[]): readonly 
 const jsonBuildObject = (fields: readonly (readonly [string, string])[]): string =>
 	pipe(RA.flatten(fields), joinToString(", "), (args) => `json_build_object(${args})`);
 
-const jsonAgg = (columns: NRA.ReadonlyNonEmptyArray<Column>): string =>
+const jsonObjectAgg = (fields: readonly (readonly [string, string])[]): string =>
+	pipe(RA.flatten(fields), joinToString(", "), (args) => `json_object_agg(${args})`);
+
+const columnKeyValues = (columns: readonly Column[]): readonly (readonly [string, string])[] =>
 	pipe(
 		columns,
-		NRA.map((col) => [`'${columnName(col)}'`, qualifiedColumnName(col)] as const),
-		jsonBuildObject,
-		(param) => `coalesce(json_agg((${param})), '[]')`
+		RA.map((col) => [`'${columnName(col)}'`, qualifiedColumnName(col)] as const)
 	);
+
+const jsonAgg = (expr: string): string => `coalesce(json_agg((${expr})), '[]')`;
 
 const valueListWithAlias = (
 	values: Values,
