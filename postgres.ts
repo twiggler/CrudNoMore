@@ -16,10 +16,12 @@ import {
 } from "./schema";
 import * as SG from "fp-ts/lib/Semigroup";
 import * as pg from "pg-promise";
+import * as RT from "fp-ts/lib/ReadonlyTuple";
 import * as TE from "fp-ts/lib/TaskEither";
 import * as N from "fp-ts/lib/number";
 import * as SEP from "fp-ts/lib/Separated";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
+import * as E from "fp-ts/lib/Either";
 
 export type Rows = RR.ReadonlyRecord<string, unknown>;
 
@@ -65,6 +67,7 @@ export const secureRead =
 			`Read document`,
 			pipe(
 				secureReadQ(documentKey, columns, refs),
+				stringifySelectQuery,
 				executeQueryOne,
 				RTE.map((result) => result["json_build_object"])
 			)
@@ -86,12 +89,24 @@ const backtraceForeignKeys = <Ext>(
 ): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, TraceResult> =>
 	pipe(
 		backtraceForeignKeysQ(documentKey, values, paths),
+		stringifySelectQuery,
 		executeQueryAny,
 		RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
 		RTE.map((tracedRowNumbers) =>
 			RA.partitionWithIndex((i, _) => RA.elem(N.Eq)(i, tracedRowNumbers))(values)
 		)
 	);
+
+interface SelectQuery {
+	select: string;
+	from: string;
+	where: string;
+}
+
+const stringifySelectQuery = ({ select, from, where }: SelectQuery) => `
+${select}
+${from}
+${where}`;
 
 const executeQueryAny =
 	<Ext, R = any>(
@@ -124,38 +139,22 @@ const secureReadQ = (
 	documentKey: unknown,
 	columns: NRA.ReadonlyNonEmptyArray<Column>,
 	refs: NRA.ReadonlyNonEmptyArray<Reference>
-): string =>
-	query(
-		select(
-			jsonBuildObject(
-				pipe(
-					columns,
-					NRA.groupBy(qualifiedTableName),
-					RR.partitionWithIndex(
-						(tableName, _) => tableName === pipe(NRA.head(refs), toTable)
-					),
-					SEP.bimap(
-						RR.collect(S.Ord)(
-							(tableName, columns) =>
-								[
-									`'${tableName}'`,
-									pipe(columns, columnKeyValues, jsonBuildObject, jsonAgg),
-								] as const
-						),
-						RR.collect(S.Ord)(
-							(tableName, columns) =>
-								[
-									`'${tableName}'`,
-									pipe(columns, columnKeyValues, jsonObjectAgg),
-								] as const
-						)
-					),
-					({ left, right }) => RA.concat(left)(right)
-				)
-			)
+): SelectQuery =>
+	pipe(
+		columns,
+		NRA.groupBy(qualifiedTableName),
+		RR.partitionWithIndex((tableName, _) => tableName === pipe(NRA.head(refs), toTable)),
+		SEP.bimap(
+			RR.map(flow(columnKeyValues, jsonBuildObject, jsonAgg)),
+			RR.map(flow(columnKeyValues, jsonObjectAgg))
 		),
-		from(pipe(NRA.head(refs), toTable)),
-		...RA.map(({ from, to }: Reference) => leftJoin(to, from))(refs),
+		({ left, right }) => RR.union(SG.first<string>())(left)(right),
+		jsonBuildObject,
+		select,
+		from(
+			pipe(NRA.head(refs), toTable),
+			RA.map(({ from, to }: Reference) => leftJoin(to, from))(refs)
+		),
 		where(
 			eq(
 				pipe(NRA.head(refs), fromColumn, qualifiedColumnName, pg.as.alias),
@@ -170,7 +169,7 @@ const backtraceForeignKeysQ = (
 	documentKey: unknown,
 	values: Values,
 	paths: NRA.ReadonlyNonEmptyArray<Path>
-): string => {
+): SelectQuery => {
 	const foreignKeys = pipe(
 		paths,
 		NRA.map((path: Path) => pipe(NRA.head(path), fromColumn, columnName))
@@ -181,24 +180,28 @@ const backtraceForeignKeysQ = (
 		NRA.mapWithIndex((i, row) => RR.upsertAt("rnum", i as unknown)(row))
 	);
 
-	return query(
+	return pipe(
 		select("rnum"),
 		from(valueListWithAlias(augmentedValues, "t", ["rnum", ...foreignKeys])),
 		whereA(
 			pipe(
 				NRA.zip(foreignKeys, paths),
-				NRA.map(([name, path]) => exists(backtrace(documentKey, name, path)))
+				NRA.map(([name, path]) =>
+					pipe(backtrace(documentKey, name, path), stringifySelectQuery, exists)
+				)
 			)
 		)
 	);
 };
 
-const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): string =>
+const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): SelectQuery =>
 	RA.size(path) > 1
-		? query(
+		? pipe(
 				selectAll(),
-				from(pipe(NRA.head(path), toTable)),
-				...RA.map(({ from, to }: Reference) => innerJoin(from, to))(NRA.tail(path)),
+				from(
+					pipe(NRA.head(path), toTable),
+					RA.map(({ from, to }: Reference) => innerJoin(from, to))(NRA.tail(path))
+				),
 				where(
 					eq(
 						pipe(NRA.head(path), toColumn, qualifiedColumnName, pg.as.alias),
@@ -210,7 +213,7 @@ const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): 
 					)
 				)
 		  )
-		: query(
+		: pipe(
 				selectAll(),
 				from(pipe(NRA.head(path), toTable)),
 				where(
@@ -251,16 +254,18 @@ const imputeValues = (values: Values, columnNames: readonly string[]): readonly 
 	);
 };
 
-const jsonBuildObject = (fields: readonly (readonly [string, string])[]): string =>
-	pipe(RA.flatten(fields), joinToString(", "), (args) => `json_build_object(${args})`);
+const flattenToString = (fields: RR.ReadonlyRecord<string, string>): string =>
+	pipe(fields, RR.toReadonlyArray, RA.map(RT.mapFst(value)), RA.flatten, joinToString(", "));
 
-const jsonObjectAgg = (fields: readonly (readonly [string, string])[]): string =>
-	pipe(RA.flatten(fields), joinToString(", "), (args) => `json_object_agg(${args})`);
+const jsonBuildObject = flow(flattenToString, (expr) => `json_build_object(${expr})`);
 
-const columnKeyValues = (columns: readonly Column[]): readonly (readonly [string, string])[] =>
+const jsonObjectAgg = flow(flattenToString, (expr) => `json_object_agg(${expr})`);
+
+const columnKeyValues = (columns: readonly Column[]): RR.ReadonlyRecord<string, string> =>
 	pipe(
 		columns,
-		RA.map((col) => [`'${columnName(col)}'`, qualifiedColumnName(col)] as const)
+		RA.map((col) => [columnName(col), qualifiedColumnName(col)] as const),
+		RR.fromFoldable(SG.first<string>(), RA.Foldable)
 	);
 
 const jsonAgg = (expr: string): string => `coalesce(json_agg((${expr})), '[]')`;
@@ -275,11 +280,13 @@ const valueListWithAlias = (
 const valueAlias = (tableName: String, columnNames: readonly string[]): string =>
 	`${tableName} (${joinToString(", ")(columnNames)})`;
 
-const query = (...expr: readonly string[]): string => joinToString("\n")(expr);
+const select = (...expr: readonly string[]): SelectQuery => ({
+	select: "select " + joinToString(",\n")(expr),
+	from: "",
+	where: "",
+});
 
-const select = (...expr: readonly string[]): string => "select " + joinToString(",\n")(expr);
-
-const selectAll = (): string => "select *";
+const selectAll = (): SelectQuery => select("*");
 
 const innerJoin = (from: Column, to: Column): string =>
 	pipe(
@@ -293,12 +300,24 @@ const leftJoin = (from: Column, to: Column): string =>
 		format("left join $1:alias on ($2:alias = $3:alias)")
 	);
 
-const from = (expr: string): string => `from ${expr}`;
+const from =
+	(tableName: string, join: readonly string[] = []) =>
+	(query: SelectQuery): SelectQuery => ({
+		...query,
+		from: `from ${tableName}\n` + joinToString("\n")(join),
+	});
 
-const where = (...conditions: NRA.ReadonlyNonEmptyArray<string>): string => whereA(conditions);
+const where =
+	(...conditions: NRA.ReadonlyNonEmptyArray<string>) =>
+	(query: SelectQuery) =>
+		whereA(conditions)(query);
 
-const whereA = (conditions: NRA.ReadonlyNonEmptyArray<string>): string =>
-	"where " + joinToString(" and ")(conditions);
+const whereA =
+	(conditions: NRA.ReadonlyNonEmptyArray<string>) =>
+	(query: SelectQuery): SelectQuery => ({
+		...query,
+		where: "where " + joinToString(" and ")(conditions),
+	});
 
 const eq = (a: string, b: string): string => `${a} = ${b}`;
 
