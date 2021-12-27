@@ -84,7 +84,7 @@ const jsType = (dataType: string): string => {
 		case "text":
 			return "string";
 		case "bigint":
-			return "BigInt";
+			return "number";
 		default:
 			return "never";
 	}

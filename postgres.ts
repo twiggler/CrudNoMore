@@ -21,7 +21,6 @@ import * as TE from "fp-ts/lib/TaskEither";
 import * as N from "fp-ts/lib/number";
 import * as SEP from "fp-ts/lib/Separated";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
-import * as E from "fp-ts/lib/Either";
 
 export type Rows = RR.ReadonlyRecord<string, unknown>;
 
