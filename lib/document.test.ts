@@ -3,7 +3,7 @@ import pgPromise, { QueryFile } from "pg-promise";
 import monitor from "pg-monitor";
 import path from "path";
 import assert from "assert";
-import { InferMutation, makeDocument, mutateP, readP } from "./document";
+import { InferMutation, makeDocument, mutateP } from "./document";
 import * as schema from "./test/schema";
 import { t1Data, t2Data, uData } from "./test/rows";
 

@@ -3,10 +3,7 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
-  "scripts": {
-    "generate": "ts-node generate.ts",
-    "test": "mocha -r ts-node/register \"*.test.ts\""
-  },
+  "scripts": {},
   "author": "",
   "license": "ISC",
   "devDependencies": {
@@ -29,5 +26,9 @@
     "pg": "^8.7.1",
     "pg-monitor": "^1.4.1",
     "pg-promise": "^10.11.0"
-  }
+  },
+  "workspaces": [
+    "lib",
+    "cli"
+  ]
 }
