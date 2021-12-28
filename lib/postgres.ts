@@ -15,6 +15,7 @@ import {
 	toTable,
 } from "./schema";
 import * as SG from "fp-ts/lib/Semigroup";
+import * as O from "fp-ts/lib/Option";
 import * as pg from "pg-promise";
 import * as RT from "fp-ts/lib/ReadonlyTuple";
 import * as TE from "fp-ts/lib/TaskEither";
@@ -22,13 +23,11 @@ import * as N from "fp-ts/lib/number";
 import * as SEP from "fp-ts/lib/Separated";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
 
-export type Rows = RR.ReadonlyRecord<string, unknown>;
+type Rows = RR.ReadonlyRecord<string, unknown>;
 
 type Values = NRA.ReadonlyNonEmptyArray<Rows>;
 
 export type Path = NRA.ReadonlyNonEmptyArray<Reference>;
-
-export type TraceResult = SEP.Separated<readonly Rows[], readonly Rows[]>;
 
 export const secureInsert =
 	<Ext>(
@@ -36,7 +35,7 @@ export const secureInsert =
 		values: Values,
 		columns: NRA.ReadonlyNonEmptyArray<Column>,
 		paths: NRA.ReadonlyNonEmptyArray<Path>
-	): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, TraceResult> =>
+	): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, readonly number[]> =>
 	(db) =>
 		dbTask(
 			db,
@@ -45,12 +44,16 @@ export const secureInsert =
 				backtraceForeignKeys(documentKey, values, paths),
 				RTE.chain((traceResult) =>
 					pipe(
-						RA.isNonEmpty(traceResult.right)
-							? insert(traceResult.right, columns)
-							: RTE.of([]),
-						RTE.map((_) => traceResult)
+						RA.filterWithIndex((i, _) => RA.elem(N.Eq)(i, traceResult))(values),
+						NRA.fromReadonlyArray,
+						O.map((values) => insert(values, columns)),
+						O.fold(
+							() => RTE.of(RA.zero<number>()),
+							RTE.map((_) => traceResult)
+						)
 					)
-				)
+				),
+				RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
 			)
 		);
 
@@ -85,15 +88,12 @@ const backtraceForeignKeys = <Ext>(
 	documentKey: unknown,
 	values: Values,
 	paths: NRA.ReadonlyNonEmptyArray<Path>
-): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, TraceResult> =>
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
 	pipe(
 		backtraceForeignKeysQ(documentKey, values, paths),
 		stringifySelectQuery,
 		executeQueryAny,
-		RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
-		RTE.map((tracedRowNumbers) =>
-			RA.partitionWithIndex((i, _) => RA.elem(N.Eq)(i, tracedRowNumbers))(values)
-		)
+		RTE.map(RA.map((result: { rnum: number }) => result.rnum))
 	);
 
 interface SelectQuery {

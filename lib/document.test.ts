@@ -57,50 +57,87 @@ describe("document", async () => {
 		it("should create rows", async () => {
 			const mutation: InferMutation<typeof document> = {
 				"public.u": {
-					create: uData,
+					create: [uData],
 				},
 				"public.t1": {
-					create: t1Data,
+					create: [t1Data],
 				},
 				"public.t2": {
-					create: t2Data,
+					create: [t2Data],
 				},
 			};
 
-			const result = await mutateP(document, 1, mutation, db);
+			const mutationErrors = await mutateP(document, 1, mutation, db);
 			const { document: documentData } = await db.one(readQuery);
 
-			assert.strictEqual(result.right.length, 3);
-			assert.strictEqual(result.left.length, 0);
+			assert.strictEqual(mutationErrors.length, 0);
 			assert.deepStrictEqual(documentData, {
-				"public.u": uData,
-				"public.t1": t1Data,
-				"public.t2": t2Data,
+				"public.u": [uData],
+				"public.t1": [t1Data],
+				"public.t2": [t2Data],
 			});
 		});
 
-		it("it should fail when creating rows in a nonexisting document", async () => {
+		it("should fail when creating rows in a nonexisting document", async () => {
 			const mutation: InferMutation<typeof document> = {
 				"public.u": {
-					create: uData,
+					create: [uData],
 				},
 				"public.t1": {
-					create: t1Data,
+					create: [t1Data],
 				},
 				"public.t2": {
-					create: t2Data,
+					create: [t2Data],
 				},
 			};
 
-			const result = await mutateP(document, 2, mutation, db);
+			const mutationErrors = await mutateP(document, 2, mutation, db);
 			const { document: documentData } = await db.one(readQuery);
 
-			assert.strictEqual(result.right.length, 0);
-			assert.strictEqual(result.left.length, 3);
+			assert.deepStrictEqual(mutationErrors, [
+				{ op: "CREATE", table: "public.t1", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ op: "CREATE", table: "public.t2", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ op: "CREATE", table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
+			]);
 			assert.deepStrictEqual(documentData, {
 				"public.u": [],
 				"public.t1": [],
 				"public.t2": [],
+			});
+		});
+
+		it("should fail when creating rows with conflicting documents", async () => {
+			await db.none("INSERT INTO public.document VALUES (2)");
+
+			const t1Data2 = { id: 21, document: 2 };
+			const mutation: InferMutation<typeof document> = {
+				"public.t1": {
+					create: [t1Data, t1Data2],
+				},
+				"public.t2": {
+					create: [t2Data],
+				},
+				"public.u": {
+					create: [
+						{
+							id: 10,
+							t1: t1Data2.id,
+							t2: 30,
+						},
+					],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, 1, mutation, db);
+			const { document: documentData } = await db.one(readQuery);
+
+			assert.deepStrictEqual(mutationErrors, [
+				{ op: "CREATE", table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
+			]);
+			assert.deepStrictEqual(documentData, {
+				"public.u": [],
+				"public.t1": [t1Data, t1Data2],
+				"public.t2": [t2Data],
 			});
 		});
 	});

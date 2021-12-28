@@ -7,10 +7,9 @@ import * as RR from "fp-ts/lib/ReadonlyRecord";
 import * as O from "fp-ts/lib/Option";
 import * as E from "fp-ts/lib/Either";
 import * as M from "fp-ts/lib/Map";
-import * as MD from "fp-ts/lib/Monoid";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
 import { Edge, Graph, makeGraph, precedingEdges, topsort } from "./graph";
-import { Path, Rows, secureInsert, secureRead, TraceResult } from "./postgres";
+import { Path, secureInsert, secureRead } from "./postgres";
 import { contramap } from "fp-ts/lib/Predicate";
 import { sequenceT } from "fp-ts/lib/Apply";
 import * as pg from "pg-promise";
@@ -44,7 +43,7 @@ export const mutate = <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>,
 	mutation: InferMutation<D>
-): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, TraceResult> => {
+): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, readonly CreateResult[]> => {
 	const [graph, root] = toGraph(document);
 	const tableToPrecedingEdge = precedingEdges(root, graph);
 
@@ -75,10 +74,11 @@ export const mutate = <D extends Document, Ext>(
 						E.chain((refs) => paths(root, tableToPrecedingEdge, refs))
 					)
 				),
-				E.getOrElse((err) => RTE.left(Error(err)))
+				E.getOrElse((err) => RTE.left(Error(err))),
+				RTE.map(RA.map((index) => makeCreateResult(tableName, index, "DOCUMENT_NOT_FOUND")))
 			)
 		),
-		RTE.map(MD.concatAll(monoidTraceResult))
+		RTE.map(RA.flatten)
 	);
 };
 
@@ -87,15 +87,15 @@ export const mutateP = async <D extends Document, Ext>(
 	id: InferDocumentRootType<D>,
 	mutation: InferMutation<D>,
 	dbConn: pg.IDatabase<Ext>
-): Promise<TraceResult> =>
+): Promise<readonly CreateResult[]> =>
 	mutate(
 		document,
 		id,
 		mutation
 	)(dbConn)().then(
 		E.fold(
-			(e: Error) => Promise.reject(e),
-			(v: TraceResult) => Promise.resolve(v)
+			(e) => Promise.reject(e),
+			(v) => Promise.resolve(v)
 		)
 	);
 
@@ -169,6 +169,22 @@ export type TableRow<C extends Column = never> = [C] extends [never]
 			[ColumnName in C["name"]]?: InferColumnType<FilterColumns<C, "name", ColumnName>>;
 	  };
 
+export type MutationError = "DOCUMENT_NOT_FOUND";
+
+export interface CreateResult {
+	op: "CREATE";
+	table: string;
+	index: number;
+	error: MutationError;
+}
+
+const makeCreateResult = (table: string, index: number, error: MutationError): CreateResult => ({
+	op: "CREATE",
+	table,
+	index,
+	error,
+});
+
 const toGraph = (document: Document): readonly [Graph<Reference>, string] =>
 	pipe(
 		(ts: NRA.ReadonlyNonEmptyArray<string>) => (edges: readonly Edge<Reference>[]) =>
@@ -222,11 +238,6 @@ const filterColumnsByTable = <D extends Document>(document: D, tableName: string
 
 const filterReferencesByTable = <D extends Document>(document: D, tableName: string) =>
 	pipe(document, references, RA.filter(contramap(fromTable)((x) => x === tableName)));
-
-const monoidTraceResult: MD.Monoid<TraceResult> = MD.struct({
-	left: RA.getMonoid<Rows>(),
-	right: RA.getMonoid<Rows>(),
-});
 
 type InferTables<C extends readonly Column[]> = C[number]["qualifiedTableName"];
 
