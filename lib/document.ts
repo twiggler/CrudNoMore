@@ -99,6 +99,7 @@ export const mutateP = async <D extends Document, Ext>(
 		)
 	);
 
+// Assumes foreign keys are non-nullable.
 export const read = <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>

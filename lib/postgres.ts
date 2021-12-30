@@ -58,7 +58,7 @@ export const secureInsert =
 		);
 
 export const secureRead =
-	<Ext, R>(
+	<Ext>(
 		documentKey: unknown,
 		columns: NRA.ReadonlyNonEmptyArray<Column>,
 		refs: NRA.ReadonlyNonEmptyArray<Reference>
@@ -71,7 +71,7 @@ export const secureRead =
 				secureReadQ(documentKey, columns, refs),
 				stringifySelectQuery,
 				executeQueryOne,
-				RTE.map((result) => result["json_build_object"])
+				RTE.map((result) => result["jsonb_build_object"])
 			)
 		);
 
@@ -144,7 +144,13 @@ const secureReadQ = (
 		NRA.groupBy(qualifiedTableName),
 		RR.partitionWithIndex((tableName, _) => tableName === pipe(NRA.head(refs), toTable)),
 		SEP.bimap(
-			RR.map(flow(columnKeyValues, jsonBuildObject, jsonAgg)),
+			RR.map((cols) =>
+				pipe(
+					columnKeyValues(cols),
+					jsonBuildObject,
+					jsonAgg(RA.findFirst((col: Column) => col.isPrimary)(cols))
+				)
+			),
 			RR.map(flow(columnKeyValues, jsonObjectAgg))
 		),
 		({ left, right }) => RR.union(SG.first<string>())(left)(right),
@@ -256,9 +262,9 @@ const imputeValues = (values: Values, columnNames: readonly string[]): readonly 
 const flattenToString = (fields: RR.ReadonlyRecord<string, string>): string =>
 	pipe(fields, RR.toReadonlyArray, RA.map(RT.mapFst(value)), RA.flatten, joinToString(", "));
 
-const jsonBuildObject = flow(flattenToString, (expr) => `json_build_object(${expr})`);
+const jsonBuildObject = flow(flattenToString, (expr) => `jsonb_build_object(${expr})`);
 
-const jsonObjectAgg = flow(flattenToString, (expr) => `json_object_agg(${expr})`);
+const jsonObjectAgg = flow(flattenToString, (expr) => `jsonb_object_agg(${expr})`);
 
 const columnKeyValues = (columns: readonly Column[]): RR.ReadonlyRecord<string, string> =>
 	pipe(
@@ -267,7 +273,17 @@ const columnKeyValues = (columns: readonly Column[]): RR.ReadonlyRecord<string, 
 		RR.fromFoldable(SG.first<string>(), RA.Foldable)
 	);
 
-const jsonAgg = (expr: string): string => `coalesce(json_agg((${expr})), '[]')`;
+const jsonAgg =
+	(testColumn: O.Option<Column>) =>
+	(expr: string): string =>
+		pipe(
+			testColumn,
+			O.map(flow(qualifiedColumnName, pg.as.alias)),
+			O.fold(
+				() => `coalesce(jsonb_agg(distinct ${expr}), '[]')`,
+				(c) => `coalesce(jsonb_agg(distinct ${expr}) filter (where ${c} is not null), '[]')`
+			)
+		);
 
 const valueListWithAlias = (
 	values: Values,

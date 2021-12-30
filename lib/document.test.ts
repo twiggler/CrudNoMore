@@ -3,7 +3,7 @@ import pgPromise, { QueryFile } from "pg-promise";
 import monitor from "pg-monitor";
 import path from "path";
 import assert from "assert";
-import { InferMutation, makeDocument, mutateP } from "./document";
+import { InferMutation, makeDocument, mutateP, readP } from "./document";
 import * as schema from "./test/schema";
 import { t1Data, t2Data, uData } from "./test/rows";
 
@@ -24,6 +24,7 @@ describe("document", async () => {
 	const schemaQuery = new QueryFile(path.resolve(__dirname, "test", "schema.sql"));
 	const resetQuery = new QueryFile(path.resolve(__dirname, "test", "reset.sql"));
 	const readQuery = new QueryFile(path.resolve(__dirname, "test", "read.sql"));
+	const populateQuery = new QueryFile(path.resolve(__dirname, "test", "populate.sql"));
 
 	const document = makeDocument(
 		schema.publicDocumentId,
@@ -91,7 +92,7 @@ describe("document", async () => {
 				},
 			};
 
-			const mutationErrors = await mutateP(document, 2, mutation, db);
+			const mutationErrors = await mutateP(document, -999, mutation, db);
 			const { document: documentData } = await db.one(readQuery);
 
 			assert.deepStrictEqual(mutationErrors, [
@@ -107,8 +108,6 @@ describe("document", async () => {
 		});
 
 		it("should fail when creating rows with conflicting documents", async () => {
-			await db.none("INSERT INTO public.document VALUES (2)");
-
 			const t1Data2 = { id: 21, document: 2 };
 			const mutation: InferMutation<typeof document> = {
 				"public.t1": {
@@ -138,6 +137,44 @@ describe("document", async () => {
 				"public.u": [],
 				"public.t1": [t1Data, t1Data2],
 				"public.t2": [t2Data],
+			});
+		});
+	});
+
+	describe("read", () => {
+		beforeEach(async () => {
+			await db.none(populateQuery);
+		});
+
+		it("should read documents", async () => {
+			const documentData = await readP(document, 1, db);
+
+			assert.deepStrictEqual(documentData, {
+				"public.document": { id: 1 },
+				"public.t1": [
+					{ id: 10, document: 1 },
+					{ id: 11, document: 1 },
+				],
+				"public.t2": [
+					{
+						id: 20,
+						t1: 10,
+					},
+				],
+				"public.u": [
+					{
+						id: 30,
+						t1: 10,
+						t2: 20,
+						data: "Data1",
+					},
+					{
+						id: 31,
+						t1: 10,
+						t2: 20,
+						data: "Data2",
+					},
+				],
 			});
 		});
 	});
