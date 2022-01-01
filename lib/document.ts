@@ -43,7 +43,7 @@ export const mutate = <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>,
 	mutation: InferMutation<D>
-): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, readonly CreateResult[]> => {
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly CreateResult[]> => {
 	const [graph, root] = toGraph(document);
 	const tableToPrecedingEdge = precedingEdges(root, graph);
 
@@ -86,13 +86,13 @@ export const mutateP = async <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>,
 	mutation: InferMutation<D>,
-	dbConn: pg.IDatabase<Ext>
+	dbProtocol: pg.IBaseProtocol<Ext>
 ): Promise<readonly CreateResult[]> =>
 	mutate(
 		document,
 		id,
 		mutation
-	)(dbConn)().then(
+	)(dbProtocol)().then(
 		E.fold(
 			(e) => Promise.reject(e),
 			(v) => Promise.resolve(v)
@@ -103,7 +103,7 @@ export const mutateP = async <D extends Document, Ext>(
 export const read = <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>
-): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, InferReadModel<Document>> => {
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, InferReadModel<Document>> => {
 	const [graph, root] = toGraph(document);
 	const tableToPrecedingEdge = precedingEdges(root, graph);
 
@@ -117,7 +117,7 @@ export const read = <D extends Document, Ext>(
 			() => RTE.left(Error("Tables are not connected.")),
 			(refs) =>
 				secureRead(id, document.columns, refs) as RTE.ReaderTaskEither<
-					pg.IDatabase<Ext>,
+					pg.IBaseProtocol<Ext>,
 					Error,
 					InferReadModel<Document>
 				>
@@ -128,12 +128,12 @@ export const read = <D extends Document, Ext>(
 export const readP = async <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>,
-	dbConn: pg.IDatabase<Ext>
+	dbProtocol: pg.IBaseProtocol<Ext>
 ): Promise<InferReadModel<Document>> =>
 	read(
 		document,
 		id
-	)(dbConn)().then(
+	)(dbProtocol)().then(
 		E.fold(
 			(e: Error) => Promise.reject(e),
 			(v: InferReadModel<Document>) => Promise.resolve(v)

@@ -29,55 +29,34 @@ type Values = NRA.ReadonlyNonEmptyArray<Rows>;
 
 export type Path = NRA.ReadonlyNonEmptyArray<Reference>;
 
-export const secureInsert =
-	<Ext>(
-		documentKey: unknown,
-		values: Values,
-		columns: NRA.ReadonlyNonEmptyArray<Column>,
-		paths: NRA.ReadonlyNonEmptyArray<Path>
-	): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, readonly number[]> =>
-	(db) =>
-		dbTask(
-			db,
-			`Insert: table ${pipe(columns, NRA.head, qualifiedTableName)}`,
-			pipe(
-				select("rnum"),
-				from("trace"),
-				cte("trace", backtraceForeignKeysQ(documentKey, values, columns, paths)),
-				cte("ir", insertQ(columns, "trace")),
-				stringifyQuery,
-				executeQueryAny,
-				RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
-				RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
-			)
-		);
+export const secureInsert = <Ext>(
+	documentKey: unknown,
+	values: Values,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	paths: NRA.ReadonlyNonEmptyArray<Path>
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
+	pipe(
+		select("rnum"),
+		from("trace"),
+		cte("trace", backtraceForeignKeysQ(documentKey, values, columns, paths)),
+		cte("ir", insertQ(columns, "trace")),
+		stringifyQuery,
+		executeQueryAny,
+		RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
+		RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
+	);
 
-export const secureRead =
-	<Ext>(
-		documentKey: unknown,
-		columns: NRA.ReadonlyNonEmptyArray<Column>,
-		refs: NRA.ReadonlyNonEmptyArray<Reference>
-	): RTE.ReaderTaskEither<pg.IDatabase<Ext>, Error, any> =>
-	(db) =>
-		dbTask(
-			db,
-			`Read document`,
-			pipe(
-				secureReadQ(documentKey, columns, refs),
-				stringifyQuery,
-				executeQueryOne,
-				RTE.map((result) => result["jsonb_build_object"])
-			)
-		);
-
-const dbTask =
-	<Ext, M>(
-		db: pg.IDatabase<Ext>,
-		tag: string,
-		cb: (t: pg.ITask<Ext>) => TE.TaskEither<any, M>
-	): TE.TaskEither<any, M> =>
-	() =>
-		db.task(tag, (t) => cb(t)());
+export const secureRead = <Ext>(
+	documentKey: unknown,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	refs: NRA.ReadonlyNonEmptyArray<Reference>
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, any> =>
+	pipe(
+		secureReadQ(documentKey, columns, refs),
+		stringifyQuery,
+		executeQueryOne,
+		RTE.map((result) => result["jsonb_build_object"])
+	);
 
 interface SelectQuery {
 	ctes: readonly (readonly [string, SelectQuery | string])[];
