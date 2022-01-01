@@ -41,18 +41,13 @@ export const secureInsert =
 			db,
 			`Insert: table ${pipe(columns, NRA.head, qualifiedTableName)}`,
 			pipe(
-				backtraceForeignKeys(documentKey, values, paths),
-				RTE.chain((traceResult) =>
-					pipe(
-						RA.filterWithIndex((i, _) => RA.elem(N.Eq)(i, traceResult))(values),
-						NRA.fromReadonlyArray,
-						O.map((values) => insert(values, columns)),
-						O.fold(
-							() => RTE.of(RA.zero<number>()),
-							RTE.map((_) => traceResult)
-						)
-					)
-				),
+				select("rnum"),
+				from("trace"),
+				cte("trace", backtraceForeignKeysQ(documentKey, values, columns, paths)),
+				cte("ir", insertQ(columns, "trace")),
+				stringifyQuery,
+				executeQueryAny,
+				RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
 				RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
 			)
 		);
@@ -69,7 +64,7 @@ export const secureRead =
 			`Read document`,
 			pipe(
 				secureReadQ(documentKey, columns, refs),
-				stringifySelectQuery,
+				stringifyQuery,
 				executeQueryOne,
 				RTE.map((result) => result["jsonb_build_object"])
 			)
@@ -84,28 +79,24 @@ const dbTask =
 	() =>
 		db.task(tag, (t) => cb(t)());
 
-const backtraceForeignKeys = <Ext>(
-	documentKey: unknown,
-	values: Values,
-	paths: NRA.ReadonlyNonEmptyArray<Path>
-): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
-	pipe(
-		backtraceForeignKeysQ(documentKey, values, paths),
-		stringifySelectQuery,
-		executeQueryAny,
-		RTE.map(RA.map((result: { rnum: number }) => result.rnum))
-	);
-
 interface SelectQuery {
+	ctes: readonly (readonly [string, SelectQuery | string])[];
 	select: string;
 	from: string;
 	where: string;
 }
 
-const stringifySelectQuery = ({ select, from, where }: SelectQuery) => `
-${select}
-${from}
-${where}`;
+const stringifyQuery = ({ select, from, where, ctes }: SelectQuery): string =>
+	pipe(
+		ctes,
+		RA.map(RT.mapSnd((query) => (typeof query === "string" ? query : stringifyQuery(query)))),
+		RA.map(([alias, query]) => `${alias} as (${query})`),
+		RA.match(
+			() => "",
+			(stringifiedCtes) => "with " + joinToString(", ")(stringifiedCtes)
+		),
+		(cteString) => joinToString("\n")([cteString, select, from, where])
+	);
 
 const executeQueryAny =
 	<Ext, R = any>(
@@ -127,11 +118,13 @@ const parseError = (err: unknown): Error => {
 	} else return Error("Unknown error");
 };
 
-const insertQ = (values: Values, columns: NRA.ReadonlyNonEmptyArray<Column>): string => {
+const insertQ = (columns: NRA.ReadonlyNonEmptyArray<Column>, sourceAlias: string): string => {
 	const tableName = pipe(NRA.head(columns), qualifiedTableName);
 	const columnNames = NRA.map(columnName)(columns);
+	const sourceQuery = pipe(select(...columnNames), from(sourceAlias), stringifyQuery);
 
-	return `INSERT INTO ${valueAlias(tableName, columnNames)} ${valueList(values, columnNames)}`;
+	const destColumns = valueAlias(tableName, columnNames);
+	return `INSERT INTO ${destColumns} ${sourceQuery}`;
 };
 
 const secureReadQ = (
@@ -168,11 +161,10 @@ const secureReadQ = (
 		)
 	);
 
-const insert = flow(insertQ, executeQueryAny);
-
 const backtraceForeignKeysQ = (
 	documentKey: unknown,
 	values: Values,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
 	paths: NRA.ReadonlyNonEmptyArray<Path>
 ): SelectQuery => {
 	const foreignKeys = pipe(
@@ -181,18 +173,17 @@ const backtraceForeignKeysQ = (
 	);
 	const augmentedValues = pipe(
 		values,
-		NRA.map(RR.filterWithIndex((columnName) => RA.elem(S.Eq)(columnName, foreignKeys))),
 		NRA.mapWithIndex((i, row) => RR.upsertAt("rnum", i as unknown)(row))
 	);
 
 	return pipe(
-		select("rnum"),
-		from(valueListWithAlias(augmentedValues, "t", ["rnum", ...foreignKeys])),
+		selectAll(),
+		from(valueListWithAlias(augmentedValues, "t", ["rnum", ...NRA.map(columnName)(columns)])),
 		whereA(
 			pipe(
 				NRA.zip(foreignKeys, paths),
 				NRA.map(([name, path]) =>
-					pipe(backtrace(documentKey, name, path), stringifySelectQuery, exists)
+					pipe(backtrace(documentKey, name, path), stringifyQuery, exists)
 				)
 			)
 		)
@@ -299,7 +290,15 @@ const select = (...expr: readonly string[]): SelectQuery => ({
 	select: "select " + joinToString(",\n")(expr),
 	from: "",
 	where: "",
+	ctes: [],
 });
+
+const cte =
+	(alias: string, cteQuery: SelectQuery | string) =>
+	(query: SelectQuery): SelectQuery => ({
+		...query,
+		ctes: RA.append([alias, cteQuery] as const)(query.ctes),
+	});
 
 const selectAll = (): SelectQuery => select("*");
 
