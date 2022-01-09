@@ -6,6 +6,7 @@ import * as S from "fp-ts/String";
 import { intercalate } from "fp-ts/lib/Foldable";
 import {
 	Column,
+	columnDbType,
 	columnName,
 	fromColumn,
 	qualifiedColumnName,
@@ -16,6 +17,7 @@ import {
 } from "./schema";
 import * as SG from "fp-ts/lib/Semigroup";
 import * as O from "fp-ts/lib/Option";
+import * as Eq from "fp-ts/lib/Eq";
 import * as pg from "pg-promise";
 import * as RT from "fp-ts/lib/ReadonlyTuple";
 import * as TE from "fp-ts/lib/TaskEither";
@@ -23,28 +25,65 @@ import * as N from "fp-ts/lib/number";
 import * as SEP from "fp-ts/lib/Separated";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
 
-type Rows = RR.ReadonlyRecord<string, unknown>;
+type Row = RR.ReadonlyRecord<string, unknown>;
 
-type Values = NRA.ReadonlyNonEmptyArray<Rows>;
+type Values = NRA.ReadonlyNonEmptyArray<Row>;
 
 export type Path = NRA.ReadonlyNonEmptyArray<Reference>;
 
-export const secureInsert = <Ext>(
-	documentKey: unknown,
-	values: Values,
-	columns: NRA.ReadonlyNonEmptyArray<Column>,
-	paths: NRA.ReadonlyNonEmptyArray<Path>
-): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
-	pipe(
-		select("rnum"),
-		from("trace"),
-		cte("trace", backtraceForeignKeysQ(documentKey, values, columns, paths)),
-		cte("ir", insertQ(columns, "trace")),
-		stringifyQuery,
-		executeQueryAny,
-		RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
-		RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
-	);
+export const secureInsert =
+	<Ext>(
+		documentKey: unknown,
+		tableName: string,
+		columns: NRA.ReadonlyNonEmptyArray<Column>,
+		paths: NRA.ReadonlyNonEmptyArray<Path>
+	) =>
+	(values: Values): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
+		pipe(
+			select("rnum"),
+			from("trace"),
+			cte(
+				"trace",
+				pipe(imputeValues(values, columns, "default"), (augmented) =>
+					backtraceNewQ(documentKey, augmented, columns, paths)
+				)
+			),
+			cte("ir", insertQ(tableName, columns, "trace")),
+			stringifyQuery,
+			executeQueryAny,
+			RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
+			RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
+		);
+
+export const secureUpdate =
+	<Ext>(
+		documentKey: unknown,
+		tableName: string,
+		[primary, ...rest]: NRA.ReadonlyNonEmptyArray<Column>,
+		paths: NRA.ReadonlyNonEmptyArray<Path>
+	) =>
+	(values: Values): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly unknown[]> =>
+		pipe(
+			select(as(primary, "id")),
+			from("ir"),
+			cte(
+				"current",
+				pipe(selectColumn(values, primary), (ids) =>
+					backtraceExistingQ(documentKey, ids, primary, paths)
+				)
+			),
+			cte(
+				"new",
+				pipe(imputeValues(values, [primary, ...rest], null), (imputed) =>
+					backtraceUpdatesQ(documentKey, imputed, [primary, ...rest], paths)
+				)
+			),
+			cte("ir", updateQ(tableName, [primary, ...rest], "current", "new")),
+			stringifyQuery,
+			executeQueryAny,
+			RTE.map(RA.map((result: { id: unknown }) => result.id)),
+			RTE.map((trace) => RA.difference(Eq.eqStrict)(selectColumn(values, primary), trace))
+		);
 
 export const secureRead = <Ext>(
 	documentKey: unknown,
@@ -57,13 +96,16 @@ export const secureRead = <Ext>(
 		executeQueryOne,
 		RTE.map((result) => result["jsonb_build_object"])
 	);
-
 interface SelectQuery {
 	ctes: readonly (readonly [string, SelectQuery | string])[];
 	select: string;
 	from: string;
 	where: string;
 }
+
+// TODO: express that column is present in value records
+const selectColumn = (values: Values, column: Column) =>
+	pipe(columnName(column), (primaryKey) => NRA.chain((row: Row) => [row[primaryKey]])(values));
 
 const stringifyQuery = ({ select, from, where, ctes }: SelectQuery): string =>
 	pipe(
@@ -74,7 +116,8 @@ const stringifyQuery = ({ select, from, where, ctes }: SelectQuery): string =>
 			() => "",
 			(stringifiedCtes) => "with " + joinToString(", ")(stringifiedCtes)
 		),
-		(cteString) => joinToString("\n")([cteString, select, from, where])
+		(cteString) =>
+			joinToString("\n")([cteString, select, from, where !== "" ? `where ${where}` : ""])
 	);
 
 const executeQueryAny =
@@ -97,14 +140,47 @@ const parseError = (err: unknown): Error => {
 	} else return Error("Unknown error");
 };
 
-const insertQ = (columns: NRA.ReadonlyNonEmptyArray<Column>, sourceAlias: string): string => {
-	const tableName = pipe(NRA.head(columns), qualifiedTableName);
+const insertQ = (
+	tableName: string,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	sourceAlias: string
+): string => {
 	const columnNames = NRA.map(columnName)(columns);
 	const sourceQuery = pipe(select(...columnNames), from(sourceAlias), stringifyQuery);
 
 	const destColumns = valueAlias(tableName, columnNames);
 	return `INSERT INTO ${destColumns} ${sourceQuery}`;
 };
+
+const updateQ = (
+	tableName: string,
+	[primary, ...columns]: NRA.ReadonlyNonEmptyArray<Column>,
+	currentAlias: string,
+	newAlias: string
+): string =>
+	pipe(
+		columns,
+		RA.map((column) => [qualifiedColumnName(column), columnName(column)] as const),
+		RA.map(
+			([qName, name]) =>
+				[pg.as.alias(qName), pg.as.alias(`${newAlias}.${name}`), pg.as.alias(name)] as const
+		),
+		RA.map(([qname, newName, name]) => `${name} = coalesce(${newName}, ${qname})`),
+		joinToString(", "),
+		(assignments) =>
+			pipe(
+				[qualifiedColumnName(primary), columnName(primary)] as const,
+				([qualified, name]) =>
+					[pg.as.alias(qualified), pg.as.alias(`${newAlias}.${name}`)] as const,
+				([escapedQualifiedName, escapedName]) => `
+					update ${tableName} set ${assignments}
+					from ${newAlias}
+					where ${escapedQualifiedName} = ${escapedName} and
+					${qualifiedColumnName(primary)} in (select ${columnName(primary)} from ${currentAlias})
+					returning ${qualifiedColumnName(primary)}
+				`
+			)
+	);
 
 const secureReadQ = (
 	documentKey: unknown,
@@ -140,39 +216,84 @@ const secureReadQ = (
 		)
 	);
 
-const backtraceForeignKeysQ = (
+const backtraceExistingQ = (
+	documentKey: unknown,
+	ids: readonly unknown[],
+	primaryKey: Column,
+	paths: NRA.ReadonlyNonEmptyArray<Path>
+) =>
+	pipe(
+		select(primaryKey),
+		from(qualifiedTableName(primaryKey)),
+		where(
+			inValueList(primaryKey, ids),
+			pipe(
+				paths,
+				NRA.map((path) => path.length),
+				NRA.zip(paths),
+				NRA.reduce(
+					[Number.POSITIVE_INFINITY, NRA.head(paths)] as const,
+					([minLength, minPath], [length, path]) =>
+						length < minLength
+							? ([length, path] as const)
+							: ([minLength, minPath] as const)
+				),
+				([_, path]) => pipe(backtrace(documentKey, path), stringifyQuery, exists)
+			)
+		)
+	);
+
+const backtraceUpdatesQ = (
+	documentKey: unknown,
+	values: Values,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	paths: NRA.ReadonlyNonEmptyArray<Path>
+): SelectQuery =>
+	pipe(
+		select(),
+		from(valueListWithAlias(values, "t", NRA.map(columnName)(columns))),
+		whereA(
+			pipe(
+				paths,
+				NRA.map((path: Path) =>
+					pipe(
+						backtrace(documentKey, path),
+						stringifyQuery,
+						exists,
+						or(pipe(NRA.head(path), fromColumn, isNull))
+					)
+				)
+			)
+		)
+	);
+
+const backtraceNewQ = (
 	documentKey: unknown,
 	values: Values,
 	columns: NRA.ReadonlyNonEmptyArray<Column>,
 	paths: NRA.ReadonlyNonEmptyArray<Path>
 ): SelectQuery => {
-	const foreignKeys = pipe(
-		paths,
-		NRA.map((path: Path) => pipe(NRA.head(path), fromColumn, columnName))
-	);
 	const augmentedValues = pipe(
 		values,
 		NRA.mapWithIndex((i, row) => RR.upsertAt("rnum", i as unknown)(row))
 	);
 
 	return pipe(
-		selectAll(),
+		select(),
 		from(valueListWithAlias(augmentedValues, "t", ["rnum", ...NRA.map(columnName)(columns)])),
 		whereA(
 			pipe(
-				NRA.zip(foreignKeys, paths),
-				NRA.map(([name, path]) =>
-					pipe(backtrace(documentKey, name, path), stringifyQuery, exists)
-				)
+				paths,
+				NRA.map((path: Path) => pipe(backtrace(documentKey, path), stringifyQuery, exists))
 			)
 		)
 	);
 };
 
-const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): SelectQuery =>
+const backtrace = (documentKey: unknown, path: Path): SelectQuery =>
 	RA.size(path) > 1
 		? pipe(
-				selectAll(),
+				select(),
 				from(
 					pipe(NRA.head(path), toTable),
 					RA.map(({ from, to }: Reference) => innerJoin(from, to))(NRA.tail(path))
@@ -180,7 +301,7 @@ const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): 
 				where(
 					eq(
 						pipe(NRA.head(path), toColumn, qualifiedColumnName, pg.as.alias),
-						pg.as.alias(startColumnAlias)
+						pg.as.alias(pipe(NRA.head(path), fromColumn, columnName))
 					),
 					eq(
 						pipe(NRA.last(path), toColumn, qualifiedColumnName, pg.as.alias),
@@ -189,7 +310,7 @@ const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): 
 				)
 		  )
 		: pipe(
-				selectAll(),
+				select(),
 				from(pipe(NRA.head(path), toTable)),
 				where(
 					eq(
@@ -199,11 +320,35 @@ const backtrace = (documentKey: unknown, startColumnAlias: string, path: Path): 
 				)
 		  );
 
+// pg.helpers.values is not used here because:
+// 1. It depends on an initialized pg-promise instance.
+// 2. It does not support conditional casts.
+const valueListWithAlias = (
+	values: Values,
+	tableName: string,
+	columnNames: readonly string[]
+): string => {
+	const alias = valueAlias(tableName, RA.sort(S.Ord)(columnNames));
+	const list = valueList(values, columnNames);
+
+	return `(${list}) as ${alias}`;
+};
+const valueAlias = (tableName: string, columnNames: readonly string[]): string => {
+	const escapedTableName = pg.as.alias(tableName);
+	const escapedColumnNames = pipe(
+		columnNames,
+		RA.map((name) => pg.as.alias(name)),
+		joinToString(", ")
+	);
+
+	return `${escapedTableName} (${escapedColumnNames})`;
+};
+
 const valueList = (values: Values, columnNames: readonly string[]): string =>
 	pipe(
 		format,
 		apply(valueListQuery(values.length, columnNames.length)),
-		apply(imputeValues(values, columnNames))
+		apply(RA.chain(RR.collect(S.Ord)((_, v) => v))(values))
 	);
 
 const valueListQuery = (rows: number, columns: number): string =>
@@ -216,18 +361,23 @@ const valueListQuery = (rows: number, columns: number): string =>
 		joinToString(",\n")
 	);
 
-const imputeValues = (values: Values, columnNames: readonly string[]): readonly unknown[] => {
-	const defaultValues = RR.fromFoldableMap(SG.first<string>(), RA.Foldable)(
-		columnNames,
-		(key) => [key, "DEFAULT"]
+const imputeValues = (
+	values: Values,
+	columns: readonly Column[],
+	def: "default" | null
+): Values => {
+	const defaultValues = RR.fromFoldableMap(SG.first<unknown>(), RA.Foldable)(
+		RA.map((col: Column) => [columnName(col), columnDbType(col)] as const)(columns),
+		([name, dbType]) => [name, def === null ? typedNullValue(dbType) : def]
 	);
 
-	return pipe(
-		values,
-		NRA.map(RR.union(SG.first<unknown>())(defaultValues)),
-		RA.chain(RR.collect(S.Ord)((_, v) => v))
-	);
+	return pipe(values, NRA.map(RR.union(SG.first<unknown>())(defaultValues)));
 };
+
+const typedNullValue = (dbType: string) => () => ({
+	toPostgres: () => `null::${dbType}`,
+	rawType: true,
+});
 
 const flattenToString = (fields: RR.ReadonlyRecord<string, string>): string =>
 	pipe(fields, RR.toReadonlyArray, RA.map(RT.mapFst(value)), RA.flatten, joinToString(", "));
@@ -255,18 +405,15 @@ const jsonAgg =
 			)
 		);
 
-const valueListWithAlias = (
-	values: Values,
-	tableName: string,
-	columnNames: readonly string[]
-): string =>
-	`(${valueList(values, columnNames)}) as ${valueAlias(tableName, RA.sort(S.Ord)(columnNames))}`;
-
-const valueAlias = (tableName: String, columnNames: readonly string[]): string =>
-	`${tableName} (${joinToString(", ")(columnNames)})`;
-
-const select = (...expr: readonly string[]): SelectQuery => ({
-	select: "select " + joinToString(",\n")(expr),
+const select = (
+	first: string | Column = "*",
+	...expr: readonly (string | Column)[]
+): SelectQuery => ({
+	select: pipe(
+		[first, ...expr],
+		NRA.map((expr) => (typeof expr === "string" ? expr : pg.as.alias(columnName(expr)))),
+		(exprs) => "select " + joinToString(",\n")(exprs)
+	),
 	from: "",
 	where: "",
 	ctes: [],
@@ -278,8 +425,6 @@ const cte =
 		...query,
 		ctes: RA.append([alias, cteQuery] as const)(query.ctes),
 	});
-
-const selectAll = (): SelectQuery => select("*");
 
 const innerJoin = (from: Column, to: Column): string =>
 	pipe(
@@ -309,10 +454,24 @@ const whereA =
 	(conditions: NRA.ReadonlyNonEmptyArray<string>) =>
 	(query: SelectQuery): SelectQuery => ({
 		...query,
-		where: "where " + joinToString(" and ")(conditions),
+		where: pipe(
+			conditions,
+			NRA.map((condition) => `(${condition})`),
+			(terms) =>
+				(query.where !== "" ? query.where + " and " : "") + joinToString(" and ")(terms)
+		),
 	});
 
 const eq = (a: string, b: string): string => `${a} = ${b}`;
+
+const or =
+	(x: string) =>
+	(y: string): string =>
+		`${x} or ${y}`;
+
+const as = (column: Column, alias: string) => pg.as.alias(columnName(column)) + ` as ${alias}`;
+
+const isNull = (column: Column): string => pg.as.alias(columnName(column)) + " is null";
 
 const exists = (subQuery: string): string => `exists (${subQuery})`;
 
@@ -321,4 +480,7 @@ const value = (v: unknown): string => pg.as.format("$1", v);
 const joinToString = (sep: string) => (values: readonly string[]) =>
 	intercalate(S.Monoid, RA.Foldable)(sep, values);
 
-const format = (query: string) => (values?: any) => pg.as.format(query, values);
+const format = (query: string) => (values: readonly unknown[]) => pg.as.format(query, values);
+
+const inValueList = (column: Column, values: readonly unknown[]): string =>
+	pg.as.format("$1:alias in ($2:csv)", [columnName(column), values]);

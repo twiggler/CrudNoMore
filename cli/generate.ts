@@ -14,7 +14,6 @@ import * as SG from "fp-ts/lib/Semigroup";
 import * as M from "fp-ts/lib/Map";
 import * as STR from "fp-ts/lib/string";
 import * as ts from "typescript";
-import { readFileSync } from "fs";
 import { sequenceT } from "fp-ts/lib/Apply";
 
 type ColumnIdentifierById = Map<Column["id"], ts.Identifier>;
@@ -97,6 +96,7 @@ const makeColumnNodes = (column: Column): [ColumnIdentifierById, NonEmptyArray<t
 		ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(column.columnName)),
 		ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(column.tableName)),
 		ts.factory.createTypeReferenceNode(jsType(column.columnDataType)),
+		ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(column.columnDataType)),
 		ts.factory.createLiteralTypeNode(isPrimaryNode),
 	]);
 
@@ -224,12 +224,7 @@ const generateAST = (columns: SchemaQueryResult): E.Either<string[], ts.Node[]> 
 const unsafeWriteCode = (nodes: ts.Node[]): string => {
 	const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
 
-	const sourceFile = ts.createSourceFile(
-		"schema.ts",
-		readFileSync("schema.ts").toString(),
-		ts.ScriptTarget.Latest,
-		true
-	);
+	const sourceFile = ts.createSourceFile("schema.ts", "", ts.ScriptTarget.Latest, true);
 
 	const nodeArray = ts.factory.createNodeArray(nodes);
 	return printer.printList(ts.ListFormat.MultiLine, nodeArray, sourceFile);

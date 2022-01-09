@@ -3,11 +3,13 @@ import { flow } from "fp-ts/lib/function";
 export interface Column<
 	Name extends string = any,
 	QualifiedTableName extends string = any,
-	_Type = any,
+	JsType = any,
+	DbType extends string = any,
 	IsPrimary extends boolean = any
 > {
 	readonly name: Name;
 	readonly qualifiedTableName: QualifiedTableName;
+	readonly dbType: DbType;
 	readonly isPrimary: IsPrimary;
 }
 
@@ -22,6 +24,10 @@ export const qualifiedColumnName = (column: Column): string =>
 	`${qualifiedTableName(column)}.${column.name}`;
 
 export const columnName = (column: Column): string => column.name;
+
+export const columnDbType = (column: Column): string => column.dbType;
+
+export const isPrimary = (column: Column): boolean => column.isPrimary;
 
 export const fromColumn = (ref: Reference) => ref.from;
 

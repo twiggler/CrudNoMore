@@ -1,15 +1,14 @@
-import { Column, Reference, qualifiedTableName, toTable, fromTable } from "./schema";
-import { apply, pipe } from "fp-ts/lib/function";
+import { Column, Reference, qualifiedTableName, toTable, fromTable, isPrimary } from "./schema";
+import { apply, flow, pipe } from "fp-ts/lib/function";
 import * as RA from "fp-ts/lib/ReadonlyArray";
 import * as NRA from "fp-ts/lib/ReadonlyNonEmptyArray";
 import * as S from "fp-ts/lib/string";
-import * as RR from "fp-ts/lib/ReadonlyRecord";
 import * as O from "fp-ts/lib/Option";
 import * as E from "fp-ts/lib/Either";
 import * as M from "fp-ts/lib/Map";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
 import { Edge, Graph, makeGraph, precedingEdges, topsort } from "./graph";
-import { Path, secureInsert, secureRead } from "./postgres";
+import { Path, secureInsert, secureRead, secureUpdate } from "./postgres";
 import { contramap } from "fp-ts/lib/Predicate";
 import { sequenceT } from "fp-ts/lib/Apply";
 import * as pg from "pg-promise";
@@ -43,28 +42,37 @@ export const mutate = <D extends Document, Ext>(
 	document: D,
 	id: InferDocumentRootType<D>,
 	mutation: InferMutation<D>
-): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly CreateResult[]> => {
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly CrudResult[]> => {
 	const [graph, root] = toGraph(document);
 	const tableToPrecedingEdge = precedingEdges(root, graph);
 
 	return pipe(
-		topsort(root, graph),
+		topsort(root, graph) as readonly [InferTables<InferDocumentColumns<D>>],
 		RA.filterMap((tableName) =>
-			sequenceT(O.Applicative)(
-				O.some(tableName),
-				pipe(
-					RR.lookup<TableMutation | undefined>(tableName, mutation),
-					O.chain((mutation) => O.fromNullable(mutation?.create)),
-					O.chain(NRA.fromReadonlyArray)
-				)
-			)
+			sequenceT(O.Applicative)(O.some(tableName), O.fromNullable(mutation[tableName]))
 		),
-		RTE.traverseSeqArray(([tableName, values]) =>
+		RTE.traverseSeqArray(([tableName, mutation]) =>
 			pipe(
 				E.right(
 					(columns: NRA.ReadonlyNonEmptyArray<Column>) =>
 						(paths: NRA.ReadonlyNonEmptyArray<Path>) =>
-							secureInsert(id, values, columns, paths)
+							pipe(
+								[
+									makeCrudTask(
+										secureInsert(id, tableName, columns, paths),
+										makeCreateResult(tableName),
+										mutation.create
+									),
+									makeCrudTask(
+										secureUpdate(id, tableName, columns, paths),
+										makeUpdateResult(tableName),
+										mutation.update
+									),
+								],
+								RA.compact,
+								RTE.sequenceSeqArray,
+								RTE.map(RA.flatten)
+							)
 				),
 				E.ap(filterColumnsByTable(document, tableName)),
 				E.ap(
@@ -74,8 +82,7 @@ export const mutate = <D extends Document, Ext>(
 						E.chain((refs) => paths(root, tableToPrecedingEdge, refs))
 					)
 				),
-				E.getOrElse((err) => RTE.left(Error(err))),
-				RTE.map(RA.map((index) => makeCreateResult(tableName, index, "DOCUMENT_NOT_FOUND")))
+				E.getOrElse((err) => RTE.left(Error(err)))
 			)
 		),
 		RTE.map(RA.flatten)
@@ -87,7 +94,7 @@ export const mutateP = async <D extends Document, Ext>(
 	id: InferDocumentRootType<D>,
 	mutation: InferMutation<D>,
 	dbProtocol: pg.IBaseProtocol<Ext>
-): Promise<readonly CreateResult[]> =>
+): Promise<readonly CrudResult[]> =>
 	mutate(
 		document,
 		id,
@@ -140,51 +147,66 @@ export const readP = async <D extends Document, Ext>(
 		)
 	);
 
-export type TableMutations<C extends readonly Column[] = readonly Column[]> = {
+export type TableMutations<C extends readonly Column[]> = {
 	[TableName in InferTables<C>]?: TableMutation<
-		FilterColumns<C[number], "qualifiedTableName", TableName>
+		Partition<FilterColumns<C[number], "qualifiedTableName", TableName>>
 	>;
 };
 
-export interface TableMutation<C extends Column = never> {
-	readonly create?: TableRow<C>[];
-	readonly update?: TableRow<C>[];
-	readonly delete?: [C] extends [never]
-		? unknown
-		: InferColumnType<FilterColumns<C, "isPrimary", true>>[];
+export interface TableMutation<P extends [Column, Column]> {
+	readonly create?: TableRow<P>[];
+	readonly update?: TableRow<P>[];
+	readonly delete?: InferColumnType<P[0]>;
 }
 
-export type ReadModels<C extends readonly Column[] = readonly Column[]> = {
+export type ReadModels<C extends readonly Column[]> = {
 	[TableName in InferTables<C>]: ReadModel<
 		FilterColumns<C[number], "qualifiedTableName", TableName>
 	>;
 };
 
-export type ReadModel<C extends Column = never> = {
+export type ReadModel<C extends Column> = {
 	[ColumnName in C["name"]]: InferColumnType<FilterColumns<C, "name", ColumnName>>;
 };
 
-export type TableRow<C extends Column = never> = [C] extends [never]
-	? { [columnName: string]: unknown }
-	: {
-			[ColumnName in C["name"]]?: InferColumnType<FilterColumns<C, "name", ColumnName>>;
-	  };
+export type TableRow<P extends [Column, Column]> = {
+	[ColumnName in P[0]["name"]]: InferColumnType<FilterColumns<P[0], "name", ColumnName>>;
+} &
+	{
+		[ColumnName in P[1]["name"]]?: InferColumnType<FilterColumns<P[1], "name", ColumnName>>;
+	};
 
 export type MutationError = "DOCUMENT_NOT_FOUND";
 
+export type CrudResult = CreateResult | UpdateResult;
+
 export interface CreateResult {
-	op: "CREATE";
 	table: string;
 	index: number;
 	error: MutationError;
 }
 
-const makeCreateResult = (table: string, index: number, error: MutationError): CreateResult => ({
-	op: "CREATE",
-	table,
-	index,
-	error,
-});
+const makeCreateResult =
+	(table: string) =>
+	(index: number, error: MutationError): CreateResult => ({
+		table,
+		index,
+		error,
+	});
+
+export interface UpdateResult {
+	table: string;
+	primaryKey: unknown;
+	error: MutationError;
+}
+
+const makeUpdateResult =
+	(table: string) =>
+	(primaryKey: unknown, error: MutationError): UpdateResult => ({
+		table,
+		primaryKey,
+		error,
+	});
 
 const toGraph = (document: Document): readonly [Graph<Reference>, string] =>
 	pipe(
@@ -228,23 +250,55 @@ const paths = (
 		)
 	);
 
-const filterColumnsByTable = <D extends Document>(document: D, tableName: string) =>
+const filterColumnsByTable = <D extends Document>(
+	document: D,
+	tableName: InferTables<InferDocumentColumns<D>>
+) =>
 	pipe(
 		document,
 		columns,
 		RA.filter(contramap(qualifiedTableName)((x) => x === tableName)),
-		NRA.fromReadonlyArray,
+		(columns) =>
+			pipe(
+				RA.findIndex(isPrimary)(columns),
+				O.chain((i) => pipe(columns, RA.prepend(columns[i]), RA.deleteAt(i + 1)))
+			),
+		O.chain(NRA.fromReadonlyArray),
 		E.fromOption(() => "No columns found")
 	);
 
-const filterReferencesByTable = <D extends Document>(document: D, tableName: string) =>
-	pipe(document, references, RA.filter(contramap(fromTable)((x) => x === tableName)));
+const filterReferencesByTable = <D extends Document>(
+	document: D,
+	tableName: InferTables<InferDocumentColumns<D>>
+) => pipe(document, references, RA.filter(contramap(fromTable)((x) => x === tableName)));
+
+type CrudTask<Ext, P extends [Column, Column], R> = (
+	values: NRA.ReadonlyNonEmptyArray<TableRow<P>>
+) => RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly R[]>;
+
+const makeCrudTask = <Ext, P extends [Column, Column], R>(
+	op: CrudTask<Ext, P, R>,
+	parseResult: (index: R, error: MutationError) => CrudResult,
+	values?: readonly TableRow<P>[]
+): O.Option<RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly CrudResult[]>> =>
+	pipe(
+		values,
+		O.fromNullable,
+		O.chain(NRA.fromReadonlyArray),
+		O.map((values) => op(values)),
+		O.map(RTE.map(RA.map((index) => parseResult(index, "DOCUMENT_NOT_FOUND"))))
+	);
 
 type InferTables<C extends readonly Column[]> = C[number]["qualifiedTableName"];
 
 type InferColumnType<C> = C extends Column<any, any, infer Type, any> ? Type : never;
 
 type FilterColumns<C extends Column, K extends keyof C, V> = C extends { [X in K]: V } ? C : never;
+
+type Partition<C extends Column> = [
+	FilterColumns<C, "isPrimary", true>,
+	FilterColumns<C, "isPrimary", false>
+];
 
 type InferDocumentRootType<D> = D extends Document<infer Root, readonly Column[]>
 	? InferColumnType<Root>

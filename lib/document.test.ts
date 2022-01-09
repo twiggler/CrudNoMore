@@ -18,6 +18,7 @@ const logSql = process.env["LOG_SQL"] ?? false;
 describe("document", async () => {
 	const initOptions = {};
 	const pgp = pgPromise(initOptions);
+	pgp.pg.types.setTypeParser(20, parseInt);
 	if (logSql) monitor.attach(initOptions);
 	const db = pgp(connectionString);
 
@@ -96,9 +97,9 @@ describe("document", async () => {
 			const { document: documentData } = await db.one(readQuery);
 
 			assert.deepStrictEqual(mutationErrors, [
-				{ op: "CREATE", table: "public.t1", index: 0, error: "DOCUMENT_NOT_FOUND" },
-				{ op: "CREATE", table: "public.t2", index: 0, error: "DOCUMENT_NOT_FOUND" },
-				{ op: "CREATE", table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.t1", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.t2", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
 			]);
 			assert.deepStrictEqual(documentData, {
 				"public.u": [],
@@ -131,13 +132,143 @@ describe("document", async () => {
 			const { document: documentData } = await db.one(readQuery);
 
 			assert.deepStrictEqual(mutationErrors, [
-				{ op: "CREATE", table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
 			]);
 			assert.deepStrictEqual(documentData, {
 				"public.u": [],
 				"public.t1": [t1Data, t1Data2],
 				"public.t2": [t2Data],
 			});
+		});
+	});
+
+	describe("update", () => {
+		beforeEach(async () => {
+			await db.none(populateQuery);
+		});
+
+		it("should update documents", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					update: [
+						{
+							id: 30,
+							data: "Update1",
+						},
+						{
+							id: 31,
+							data: "Update2",
+						},
+					],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, 1, mutation, db);
+			const { document: documentData } = await db.one(readQuery);
+
+			assert.strictEqual(mutationErrors.length, 0);
+			assert.deepStrictEqual(documentData, {
+				"public.t1": [
+					{ id: 10, document: 1 },
+					{ id: 11, document: 1 },
+					{ id: 110, document: 2 },
+				],
+				"public.t2": [
+					{ id: 20, t1: 10 },
+					{ id: 120, t1: 110 },
+				],
+				"public.u": [
+					{
+						id: 30,
+						t1: 10,
+						t2: 20,
+						data: "Update1",
+					},
+					{
+						id: 31,
+						t1: 10,
+						t2: 20,
+						data: "Update2",
+					},
+					{
+						id: 130,
+						t1: 110,
+						t2: 120,
+						data: "Data21",
+					},
+				],
+			});
+		});
+
+		it("should fail when updating rows in a nonexisting documents", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					update: [
+						{
+							id: 30,
+							data: "Update1",
+						},
+						{
+							id: 31,
+							data: "Update2",
+						},
+					],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, -999, mutation, db);
+			assert.deepStrictEqual(mutationErrors, [
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND" },
+			]);
+		});
+
+		it("should fail when updating rows of another document", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					update: [
+						{
+							id: 30,
+							data: "Update1",
+						},
+						{
+							id: 31,
+							data: "Update2",
+						},
+					],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, 2, mutation, db);
+			assert.deepStrictEqual(mutationErrors, [
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND" },
+			]);
+		});
+
+		it("should fail when updating rows to relate to another documents", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					update: [
+						{
+							id: 30,
+							t2: 120,
+							data: "Update1",
+						},
+						{
+							id: 31,
+							t2: 120,
+							data: "Update2",
+						},
+					],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, 2, mutation, db);
+			assert.deepStrictEqual(mutationErrors, [
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND" },
+			]);
 		});
 	});
 
