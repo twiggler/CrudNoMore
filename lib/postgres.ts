@@ -31,59 +31,75 @@ type Values = NRA.ReadonlyNonEmptyArray<Row>;
 
 export type Path = NRA.ReadonlyNonEmptyArray<Reference>;
 
-export const secureInsert =
-	<Ext>(
-		documentKey: unknown,
-		tableName: string,
-		columns: NRA.ReadonlyNonEmptyArray<Column>,
-		paths: NRA.ReadonlyNonEmptyArray<Path>
-	) =>
-	(values: Values): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
-		pipe(
-			select("rnum"),
-			from("trace"),
-			cte(
-				"trace",
-				pipe(imputeValues(values, columns, "default"), (augmented) =>
-					backtraceNewQ(documentKey, augmented, columns, paths)
-				)
-			),
-			cte("ir", insertQ(tableName, columns, "trace")),
-			stringifyQuery,
-			executeQueryAny,
-			RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
-			RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
-		);
+export const secureInsert = <Ext>(
+	documentKey: unknown,
+	tableName: string,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	paths: NRA.ReadonlyNonEmptyArray<Path>,
+	values: Values
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly number[]> =>
+	pipe(
+		select("rnum"),
+		from("trace"),
+		cte(
+			"trace",
+			pipe(imputeValues(values, columns, "default"), (augmented) =>
+				backtraceNewQ(documentKey, augmented, columns, paths)
+			)
+		),
+		cte("ir", insertQ(tableName, columns, "trace")),
+		stringifyQuery,
+		executeQueryAny,
+		RTE.map(RA.map((result: { rnum: number }) => result.rnum)),
+		RTE.map((trace) => RA.difference(N.Eq)(NRA.range(0, values.length - 1), trace))
+	);
 
-export const secureUpdate =
-	<Ext>(
-		documentKey: unknown,
-		tableName: string,
-		[primary, ...rest]: NRA.ReadonlyNonEmptyArray<Column>,
-		paths: NRA.ReadonlyNonEmptyArray<Path>
-	) =>
-	(values: Values): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly unknown[]> =>
-		pipe(
-			select(as(primary, "id")),
-			from("ir"),
-			cte(
-				"current",
-				pipe(selectColumn(values, primary), (ids) =>
-					backtraceExistingQ(documentKey, ids, primary, paths)
-				)
-			),
-			cte(
-				"new",
-				pipe(imputeValues(values, [primary, ...rest], null), (imputed) =>
-					backtraceUpdatesQ(documentKey, imputed, [primary, ...rest], paths)
-				)
-			),
-			cte("ir", updateQ(tableName, [primary, ...rest], "current", "new")),
-			stringifyQuery,
-			executeQueryAny,
-			RTE.map(RA.map((result: { id: unknown }) => result.id)),
-			RTE.map((trace) => RA.difference(Eq.eqStrict)(selectColumn(values, primary), trace))
-		);
+export const secureUpdate = <Ext>(
+	documentKey: unknown,
+	tableName: string,
+	[primary, ...rest]: NRA.ReadonlyNonEmptyArray<Column>,
+	paths: NRA.ReadonlyNonEmptyArray<Path>,
+	values: Values
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly unknown[]> =>
+	pipe(
+		select(as(primary, "id")),
+		from("ir"),
+		cte(
+			"current",
+			pipe(selectColumn(values, primary), (ids) =>
+				backtraceExistingQ(documentKey, ids, primary, paths)
+			)
+		),
+		cte(
+			"new",
+			pipe(imputeValues(values, [primary, ...rest], null), (imputed) =>
+				backtraceUpdatesQ(documentKey, imputed, [primary, ...rest], paths)
+			)
+		),
+		cte("ir", updateQ(tableName, [primary, ...rest], "current", "new")),
+		stringifyQuery,
+		executeQueryAny,
+		RTE.map(RA.map((result: { id: unknown }) => result.id)),
+		RTE.map((trace) => RA.difference(Eq.eqStrict)(selectColumn(values, primary), trace))
+	);
+
+export const secureDelete = <Ext>(
+	documentKey: unknown,
+	tableName: string,
+	primary: Column,
+	paths: NRA.ReadonlyNonEmptyArray<Path>,
+	ids: NRA.ReadonlyNonEmptyArray<unknown>
+): RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly unknown[]> =>
+	pipe(
+		select(as(primary, "id")),
+		from("del"),
+		cte("trace", backtraceExistingQ(documentKey, ids, primary, paths)),
+		cte("del", deleteQ(tableName, primary, "trace")),
+		stringifyQuery,
+		executeQueryAny,
+		RTE.map(RA.map((result: { id: unknown }) => result.id)),
+		RTE.map((trace) => RA.difference(Eq.eqStrict)(ids, trace))
+	);
 
 export const secureRead = <Ext>(
 	documentKey: unknown,
@@ -96,6 +112,7 @@ export const secureRead = <Ext>(
 		executeQueryOne,
 		RTE.map((result) => result["jsonb_build_object"])
 	);
+
 interface SelectQuery {
 	ctes: readonly (readonly [string, SelectQuery | string])[];
 	select: string;
@@ -150,6 +167,15 @@ const insertQ = (
 
 	const destColumns = valueAlias(tableName, columnNames);
 	return `INSERT INTO ${destColumns} ${sourceQuery}`;
+};
+
+const deleteQ = (tableName: string, primaryKey: Column, sourceAlias: string): string => {
+	const escapedTableName = pg.as.alias(tableName);
+	const escapedColumnName = pg.as.alias(columnName(primaryKey));
+
+	return `delete from ${escapedTableName}
+	where ${escapedColumnName} in (select ${escapedColumnName} from ${sourceAlias})
+	returning ${escapedColumnName}`;
 };
 
 const updateQ = (

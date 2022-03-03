@@ -97,9 +97,9 @@ describe("document", async () => {
 			const { document: documentData } = await db.one(readQuery);
 
 			assert.deepStrictEqual(mutationErrors, [
-				{ table: "public.t1", index: 0, error: "DOCUMENT_NOT_FOUND" },
-				{ table: "public.t2", index: 0, error: "DOCUMENT_NOT_FOUND" },
-				{ table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.t1", index: 0, error: "DOCUMENT_NOT_FOUND", type: "CREATE" },
+				{ table: "public.t2", index: 0, error: "DOCUMENT_NOT_FOUND", type: "CREATE" },
+				{ table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND", type: "CREATE" },
 			]);
 			assert.deepStrictEqual(documentData, {
 				"public.u": [],
@@ -132,7 +132,7 @@ describe("document", async () => {
 			const { document: documentData } = await db.one(readQuery);
 
 			assert.deepStrictEqual(mutationErrors, [
-				{ table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", index: 0, error: "DOCUMENT_NOT_FOUND", type: "CREATE" },
 			]);
 			assert.deepStrictEqual(documentData, {
 				"public.u": [],
@@ -218,8 +218,8 @@ describe("document", async () => {
 
 			const mutationErrors = await mutateP(document, -999, mutation, db);
 			assert.deepStrictEqual(mutationErrors, [
-				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND" },
-				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND", type: "UPDATE" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND", type: "UPDATE" },
 			]);
 		});
 
@@ -241,8 +241,8 @@ describe("document", async () => {
 
 			const mutationErrors = await mutateP(document, 2, mutation, db);
 			assert.deepStrictEqual(mutationErrors, [
-				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND" },
-				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND", type: "UPDATE" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND", type: "UPDATE" },
 			]);
 		});
 
@@ -266,8 +266,74 @@ describe("document", async () => {
 
 			const mutationErrors = await mutateP(document, 2, mutation, db);
 			assert.deepStrictEqual(mutationErrors, [
-				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND" },
-				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND" },
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND", type: "UPDATE" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND", type: "UPDATE" },
+			]);
+		});
+	});
+
+	describe("delete", () => {
+		beforeEach(async () => {
+			await db.none(populateQuery);
+		});
+
+		it("should delete from documents", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					delete: [30],
+				},
+				"public.t2": {
+					delete: [20],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, 1, mutation, db);
+			const { document: documentData } = await db.one(readQuery);
+
+			assert.strictEqual(mutationErrors.length, 0);
+			assert.deepStrictEqual(documentData, {
+				"public.t1": [
+					{ id: 10, document: 1 },
+					{ id: 11, document: 1 },
+					{ id: 110, document: 2 },
+				],
+				"public.t2": [{ id: 120, t1: 110 }],
+				"public.u": [
+					{
+						id: 130,
+						t1: 110,
+						t2: 120,
+						data: "Data21",
+					},
+				],
+			});
+		});
+
+		it("should fail when deleting rows in a nonexisting documents", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					delete: [30, 31],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, -999, mutation, db);
+			assert.deepStrictEqual(mutationErrors, [
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND", type: "DELETE" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND", type: "DELETE" },
+			]);
+		});
+
+		it("should fail when deleting rows of another document", async () => {
+			const mutation: InferMutation<typeof document> = {
+				"public.u": {
+					delete: [30, 31],
+				},
+			};
+
+			const mutationErrors = await mutateP(document, 2, mutation, db);
+			assert.deepStrictEqual(mutationErrors, [
+				{ table: "public.u", primaryKey: 30, error: "DOCUMENT_NOT_FOUND", type: "DELETE" },
+				{ table: "public.u", primaryKey: 31, error: "DOCUMENT_NOT_FOUND", type: "DELETE" },
 			]);
 		});
 	});

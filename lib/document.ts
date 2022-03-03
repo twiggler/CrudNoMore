@@ -4,11 +4,13 @@ import * as RA from "fp-ts/lib/ReadonlyArray";
 import * as NRA from "fp-ts/lib/ReadonlyNonEmptyArray";
 import * as S from "fp-ts/lib/string";
 import * as O from "fp-ts/lib/Option";
+import * as N from "fp-ts/lib/number";
+import * as ORD from "fp-ts/lib/Ord";
 import * as E from "fp-ts/lib/Either";
 import * as M from "fp-ts/lib/Map";
 import * as RTE from "fp-ts/lib/ReaderTaskEither";
 import { Edge, Graph, makeGraph, precedingEdges, topsort } from "./graph";
-import { Path, secureInsert, secureRead, secureUpdate } from "./postgres";
+import { Path, secureDelete, secureInsert, secureRead, secureUpdate } from "./postgres";
 import { contramap } from "fp-ts/lib/Predicate";
 import { sequenceT } from "fp-ts/lib/Apply";
 import * as pg from "pg-promise";
@@ -51,27 +53,39 @@ export const mutate = <D extends Document, Ext>(
 		RA.filterMap((tableName) =>
 			sequenceT(O.Applicative)(O.some(tableName), O.fromNullable(mutation[tableName]))
 		),
-		RTE.traverseSeqArray(([tableName, mutation]) =>
+		E.traverseReadonlyArrayWithIndex((index, [tableName, mutation]) =>
 			pipe(
 				E.right(
 					(columns: NRA.ReadonlyNonEmptyArray<Column>) =>
 						(paths: NRA.ReadonlyNonEmptyArray<Path>) =>
 							pipe(
 								[
-									makeCrudTask(
-										secureInsert(id, tableName, columns, paths),
-										makeCreateResult(tableName),
-										mutation.create
-									),
-									makeCrudTask(
-										secureUpdate(id, tableName, columns, paths),
-										makeUpdateResult(tableName),
+									makeInsertTask(
+										id,
+										tableName,
+										index,
+										columns,
+										paths,
 										mutation.update
 									),
+									makeCreateTask(
+										id,
+										tableName,
+										index + 0.5,
+										columns,
+										paths,
+										mutation.create
+									),
+									makeDeleteTask(
+										id,
+										tableName,
+										Number.MAX_SAFE_INTEGER - index,
+										NRA.head(columns),
+										paths,
+										mutation.delete
+									),
 								],
-								RA.compact,
-								RTE.sequenceSeqArray,
-								RTE.map(RA.flatten)
+								RA.compact
 							)
 				),
 				E.ap(filterColumnsByTable(document, tableName)),
@@ -81,9 +95,14 @@ export const mutate = <D extends Document, Ext>(
 						E.fromOptionK(() => "No references found")(NRA.fromReadonlyArray),
 						E.chain((refs) => paths(root, tableToPrecedingEdge, refs))
 					)
-				),
-				E.getOrElse((err) => RTE.left(Error(err)))
+				)
 			)
+		),
+		E.map(RA.flatten),
+		E.map(RA.sort(priorityOrd<Ext>())),
+		E.fold(
+			(err) => RTE.left(Error(err)),
+			RTE.traverseSeqArray(({ task }) => task)
 		),
 		RTE.map(RA.flatten)
 	);
@@ -156,7 +175,7 @@ export type TableMutations<C extends readonly Column[]> = {
 export interface TableMutation<P extends [Column, Column]> {
 	readonly create?: TableRow<P>[];
 	readonly update?: TableRow<P>[];
-	readonly delete?: InferColumnType<P[0]>;
+	readonly delete?: InferColumnType<P[0]>[];
 }
 
 export type ReadModels<C extends readonly Column[]> = {
@@ -178,35 +197,57 @@ export type TableRow<P extends [Column, Column]> = {
 
 export type MutationError = "DOCUMENT_NOT_FOUND";
 
-export type CrudResult = CreateResult | UpdateResult;
+export type CrudResult = CreateResult | UpdateResult | DeleteResult;
 
 export interface CreateResult {
 	table: string;
 	index: number;
 	error: MutationError;
+	type: "CREATE";
 }
 
-const makeCreateResult =
-	(table: string) =>
-	(index: number, error: MutationError): CreateResult => ({
-		table,
-		index,
-		error,
-	});
+const makeCreateResult = (table: string, index: number, error: MutationError): CreateResult => ({
+	table,
+	index,
+	error,
+	type: "CREATE",
+});
 
 export interface UpdateResult {
 	table: string;
 	primaryKey: unknown;
 	error: MutationError;
+	type: "UPDATE";
 }
 
-const makeUpdateResult =
-	(table: string) =>
-	(primaryKey: unknown, error: MutationError): UpdateResult => ({
-		table,
-		primaryKey,
-		error,
-	});
+const makeUpdateResult = (
+	table: string,
+	primaryKey: unknown,
+	error: MutationError
+): UpdateResult => ({
+	table,
+	primaryKey,
+	error,
+	type: "UPDATE",
+});
+
+export interface DeleteResult {
+	table: string;
+	primaryKey: unknown;
+	error: MutationError;
+	type: "DELETE";
+}
+
+const makeDeleteResult = (
+	table: string,
+	primaryKey: unknown,
+	error: MutationError
+): DeleteResult => ({
+	table,
+	primaryKey,
+	error,
+	type: "DELETE",
+});
 
 const toGraph = (document: Document): readonly [Graph<Reference>, string] =>
 	pipe(
@@ -272,21 +313,74 @@ const filterReferencesByTable = <D extends Document>(
 	tableName: InferTables<InferDocumentColumns<D>>
 ) => pipe(document, references, RA.filter(contramap(fromTable)((x) => x === tableName)));
 
-type CrudTask<Ext, P extends [Column, Column], R> = (
-	values: NRA.ReadonlyNonEmptyArray<TableRow<P>>
-) => RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly R[]>;
+interface PrioritizedTask<Ext> {
+	task: RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly CrudResult[]>;
+	priority: number;
+}
 
-const makeCrudTask = <Ext, P extends [Column, Column], R>(
-	op: CrudTask<Ext, P, R>,
-	parseResult: (index: R, error: MutationError) => CrudResult,
-	values?: readonly TableRow<P>[]
-): O.Option<RTE.ReaderTaskEither<pg.IBaseProtocol<Ext>, Error, readonly CrudResult[]>> =>
+const priorityOrd = <Ext>() => ORD.contramap((pt: PrioritizedTask<Ext>) => pt.priority)(N.Ord);
+
+const makeCreateTask = <Ext, P extends [Column, Column]>(
+	documentKey: unknown,
+	tableName: string,
+	priority: number,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	paths: NRA.ReadonlyNonEmptyArray<Path>,
+	values: readonly TableRow<P>[] | undefined
+): O.Option<PrioritizedTask<Ext>> =>
 	pipe(
 		values,
 		O.fromNullable,
 		O.chain(NRA.fromReadonlyArray),
-		O.map((values) => op(values)),
-		O.map(RTE.map(RA.map((index) => parseResult(index, "DOCUMENT_NOT_FOUND"))))
+		O.map((values) => ({
+			task: pipe(
+				secureInsert(documentKey, tableName, columns, paths, values),
+				RTE.map(RA.map((index) => makeCreateResult(tableName, index, "DOCUMENT_NOT_FOUND")))
+			),
+			priority,
+		}))
+	);
+
+const makeInsertTask = <Ext, P extends [Column, Column]>(
+	documentKey: unknown,
+	tableName: string,
+	priority: number,
+	columns: NRA.ReadonlyNonEmptyArray<Column>,
+	paths: NRA.ReadonlyNonEmptyArray<Path>,
+	values: readonly TableRow<P>[] | undefined
+): O.Option<PrioritizedTask<Ext>> =>
+	pipe(
+		values,
+		O.fromNullable,
+		O.chain(NRA.fromReadonlyArray),
+		O.map((values) => ({
+			task: pipe(
+				secureUpdate(documentKey, tableName, columns, paths, values),
+				RTE.map(RA.map((index) => makeUpdateResult(tableName, index, "DOCUMENT_NOT_FOUND")))
+			),
+			priority,
+		}))
+	);
+
+const makeDeleteTask = <Ext>(
+	documentKey: unknown,
+	tableName: string,
+	priority: number,
+	primaryKey: Column,
+	paths: NRA.ReadonlyNonEmptyArray<Path>,
+	keys?: readonly unknown[] | undefined
+): O.Option<PrioritizedTask<Ext>> =>
+	pipe(
+		keys,
+		O.fromNullable,
+		O.chain(NRA.fromReadonlyArray),
+		O.map((keys) => ({
+			task: pipe(
+				secureDelete(documentKey, tableName, primaryKey, paths, keys),
+				RTE.map(RA.map((index) => makeDeleteResult(tableName, index, "DOCUMENT_NOT_FOUND")))
+			),
+			priority,
+		}))
 	);
 
 type InferTables<C extends readonly Column[]> = C[number]["qualifiedTableName"];
