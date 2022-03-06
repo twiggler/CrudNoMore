@@ -3,7 +3,7 @@ import { QueryFile, utils, IInitOptions } from "pg-promise";
 import * as t from "io-ts";
 import { failure } from "io-ts/PathReporter";
 import { nonEmptyArray as ioNonEmptyArray, NonEmptyString } from "io-ts-types";
-import { flow, pipe } from "fp-ts/lib/function";
+import { pipe } from "fp-ts/lib/function";
 import { taskEither, nonEmptyArray, task } from "fp-ts";
 import { NonEmptyArray } from "fp-ts/lib/NonEmptyArray";
 import * as E from "fp-ts/lib/Either";
@@ -14,7 +14,10 @@ import * as SG from "fp-ts/lib/Semigroup";
 import * as M from "fp-ts/lib/Map";
 import * as STR from "fp-ts/lib/string";
 import * as ts from "typescript";
+import * as fs from "fs";
+import { promisify } from "util";
 import { sequenceT } from "fp-ts/lib/Apply";
+import yargs from "yargs";
 
 type ColumnIdentifierById = Map<Column["id"], ts.Identifier>;
 
@@ -44,8 +47,6 @@ const lookupColumnIdentifier = (
 
 const lookupColumnIdentifiers = (from: Column["id"], to: Column["id"], map: ColumnIdentifierById) =>
 	sequenceT(E.Applicative)(lookupColumnIdentifier(from, map), lookupColumnIdentifier(to, map));
-
-const connectionString = "postgresql://milicense:milicense@localhost:5432/sync";
 
 const initOptions: IInitOptions = {
 	receive(data: any[]) {
@@ -221,16 +222,17 @@ const generateAST = (columns: SchemaQueryResult): E.Either<string[], ts.Node[]> 
 			)
 	);
 
-const unsafeWriteCode = (nodes: ts.Node[]): string => {
+const unsafeWriteCode = (outPath: string, nodes: ts.Node[]): string => {
 	const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
 
-	const sourceFile = ts.createSourceFile("schema.ts", "", ts.ScriptTarget.Latest, true);
+	const sourceFile = ts.createSourceFile(outPath, "", ts.ScriptTarget.Latest, true);
 
 	const nodeArray = ts.factory.createNodeArray(nodes);
 	return printer.printList(ts.ListFormat.MultiLine, nodeArray, sourceFile);
 };
 
-const writeCode = (nodes: ts.Node[]) => E.tryCatch(() => unsafeWriteCode(nodes), resolveError);
+const writeCode = (outPath: string) => (nodes: ts.Node[]) =>
+	E.tryCatch(() => unsafeWriteCode(outPath, nodes), resolveError);
 
 const isValidationError = (err: unknown): err is t.ValidationError[] =>
 	Array.isArray(err) && err.every((e) => "value" in e && "context" in e);
@@ -245,17 +247,41 @@ const resolveError = (err: any): string[] => {
 	} else return ["Unknown error"];
 };
 
-const main = flow(
-	taskEither.tryCatchK(querySchema, resolveError),
-	taskEither.chainEitherKW(schemaQueryResultCodec.decode),
-	taskEither.chainEitherKW(generateAST),
-	taskEither.chainEitherKW(writeCode),
-	taskEither.fold(
-		(errors) => pipe(errors, resolveError, A.getShow(STR.Show).show, C.error, task.fromIO),
-		(code) => task.fromIO(C.log(code))
-	)
-);
+const writeFile = taskEither.tryCatchK(promisify(fs.writeFile), resolveError);
 
-(async () => {
-	await main(connectionString)();
-})();
+const main = (connectionString: string, outPath: string) =>
+	pipe(
+		connectionString,
+		taskEither.tryCatchK(querySchema, resolveError),
+		taskEither.chainEitherKW(schemaQueryResultCodec.decode),
+		taskEither.chainEitherKW(generateAST),
+		taskEither.chainEitherKW(writeCode(outPath)),
+		taskEither.chainW((content) => writeFile(outPath, content)),
+		taskEither.fold(
+			(errors) => pipe(errors, resolveError, A.getShow(STR.Show).show, C.error, task.fromIO),
+			(_) => async () => {}
+		)
+	);
+
+yargs
+	.scriptName("twigSync-cli")
+	.usage("$0 <cmd> [args]")
+	.command(
+		"generate",
+		"Generate typescript code from the database schema",
+		(yargs) =>
+			yargs
+				.positional("connection", {
+					type: "string",
+					describe: "Connection string of the database to connect to",
+				})
+				.positional("outfile", {
+					type: "string",
+					describe: "Path of the output file",
+				})
+				.demandOption(["connection", "outfile"])
+				.normalize("outfile"),
+		(argv): Promise<void> => main(argv.connection, argv.outfile)()
+	)
+	.demandCommand(1, "You need at least one command before moving on")
+	.help().argv;
