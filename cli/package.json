@@ -4,6 +4,7 @@
   "description": "",
   "main": "cli.js",
   "scripts": {
+    "build": "tsc",
     "dev": "ts-node src/generate.ts"
   },
   "repository": {

@@ -5,6 +5,7 @@
   "main": "index.js",
   "devDependencies": {},
   "scripts": {
+    "build": "tsc",
     "test": "mocha -r ts-node/register \"*.test.ts\""
   },
   "repository": {
