@@ -5,7 +5,8 @@
   "scripts": {
     "build": "npm run build --workspace=lib --workspace=cli",
     "postbuild": "node _build.js build",
-    "clean": "node _build.js clean"
+    "clean": "node _build.js clean",
+    "example": "ts-node-cwd examples/example.ts"
   },
   "author": "Roel de Jong",
   "license": "BSD-3-Clause",
@@ -32,7 +33,7 @@
     "pg-promise": "^10.11.0"
   },
   "workspaces": [
-    "lib",
-    "cli"
+    "src/lib",
+    "src/cli"
   ]
 }
